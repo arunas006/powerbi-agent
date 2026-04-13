@@ -1,0 +1,14 @@
+requests==2.33.1
+python-dotenv==1.2.2
+pydantic==2.12.5
+pydantic-settings==2.13.1
+openai==2.31.0
+numpy==2.4.4
+streamlit==1.56.0
+fastapi==0.135.3
+uvicorn[standard] (not installed)
+langchain==1.2.15
+langchain-openai==1.1.12
+langchain-community==0.4.1
+langgraph==1.1.6
+ipykernel==7.2.0

@@ -1,0 +1,27 @@
+{
+    "invoice-Dashboard": {
+        "objective":"The main objective of this dashboard is to provide a comprehensive view of the invoice performance of the company, allowing stakeholders to make informed decisions and identify areas for improvement.",
+        "domain":"Sales and Revenue",
+        "tags":["Sales", "Revenue", "Performance","Supply Chain"]
+    },
+    "Sales-Dashboard":{
+        "objective":"The Sales Dashboard provides a comprehensive view of the sales and revenue performance of the company, allowing stakeholders to make informed decisions and identify areas for improvement.",
+        "domain":"Sales and Revenue",
+        "tags":["Sales", "Revenue", "Performance","Supply Chain"]
+    },
+    "Purchase-Dashboard": {
+        "objective":"The Purchase Dashboard provides a comprehensive view of the purchase and inventory performance of the company, allowing stakeholders to make informed decisions and identify areas for improvement.",
+        "domain":"Purchases and Inventory",
+        "tags":["Purchases", "Inventory", "Performance","Supply Chain"]
+    },
+    "Heat cool Seat Dashboard" : {
+        "objective" : "The main objective of this dashboard is to understand the usage of heat and cool seats in cars, also data tells how the multiple levels are used by consumers",
+        "domain": "Seat climate usage",
+        "tags": ["Heat", "Cool", "seats"]
+    },
+    "Seat occupancy" : {
+        "objective" : "The main objective of this dashboard is to track how the seat is occupied in cars",
+        "domain": "Seat usage",
+        "tags": ["Front seat", "Rear seat", "cabin"]
+    }
+}

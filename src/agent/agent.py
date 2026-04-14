@@ -183,16 +183,30 @@ def delete_dashboard(
             "status": "error",
             "message": str(e)
         }
-    
+
+#-----------------------END OF TOOLS -----------------------  
+
+class MetaIntent(BaseModel):
+    action: Literal["continue", "cancel", "new_intent"]
+
+class ExtractionOutput(BaseModel):
+    dashboard_name: Optional[str]
+    source_workspace: Optional[str]
+    target_workspace: Optional[str]
+
 
 class AgentState(MessagesState):
     user_query: Optional[str]
     intent: Optional[str]
-    clarification_count: int = 0
-    is_confirmed: bool = False
+   
     dashboard_name: Optional[str] = None
     source_workspace: Optional[str] = None
     target_workspace: Optional[str] = None
+
+    extracted: bool = False
+    meta_action: Optional[str] = None
+    is_confirmed: bool = False
+    clarification_count: int = 0
 
 class IntentOutput(BaseModel):
     intent: Literal[
@@ -229,9 +243,10 @@ system_prompt = """
         - Be precise, structured, and action-oriented
         - Do not assume missing details—always confirm when required
 
-        """
-   
+        - Always prioritize the latest user message over past context
+        - If the user changes their mind or cancels an action, do NOT continue the previous intent
 
+        """
 
 def agent_state_node(state: AgentState) -> Dict[str, Any]:
     messages = state["messages"]
@@ -248,8 +263,196 @@ def agent_state_node(state: AgentState) -> Dict[str, Any]:
         "user_query": user_query,
         "intent": state.get("intent"),
         "clarification_count": state.get("clarification_count", 0),
-        "is_confirmed": state.get("is_confirmed", None)
+        "is_confirmed": state.get("is_confirmed", None),
+        "extracted": state.get("extracted", False),
+        "meta_action": state.get("meta_action"),
+        "dashboard_name": state.get("dashboard_name"),
+        "source_workspace": state.get("source_workspace"),
+        "target_workspace": state.get("target_workspace")
     }
+
+def entry_router(state: AgentState):
+    last_msg = state["messages"][-1].content.lower().strip()
+
+    # ✅ confirmation response
+    if last_msg in ["yes", "no", "y", "n"] and not state.get("is_confirmed"):
+        return "confirmation"
+    
+    return "router"
+
+router_prompt = """
+You are an expert AI agent that classifies user intent for Power BI operations.
+
+Your task is to understand the user's goal and classify it into ONE of the following intents:
+
+1. recommend_dashboards  
+   → User is looking for suggestions, insights, or relevant dashboards based on a topic
+
+2. compare_workspaces  
+   → User wants to understand differences, gaps, discrepancies, or missing dashboards 
+     between Dev and Prod workspaces
+
+3. migrate_dashboard  
+   → User wants to move, promote, or deploy a dashboard from one workspace (Dev) to another (Prod)
+
+4. delete_dashboard  
+   → User wants to remove or delete a dashboard from a workspace
+
+5. ambiguous  
+   → The user intent is unclear, incomplete, or cannot be confidently mapped
+
+---
+
+Guidelines:
+- Focus on the USER'S GOAL, not keywords
+- Use the full conversation context
+- If the user replies with short answers like "yes", "ok", infer intent from full conversation, not just last message
+- Prefer compare_workspaces when the user is asking about differences, gaps, or missing items
+- Only select migrate_dashboard or delete_dashboard if the user clearly intends an ACTION
+- If unsure → return "ambiguous"
+- Do NOT ask questions
+- Do NOT explain
+
+Return only the intent.
+"""
+
+def router_decision(state: AgentState):
+    llm = ChatOpenAI(model=settings.openai_llm_model,
+                     api_key=settings.OPENAI_API_KEY.get_secret_value())
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt + "\n\n" + router_prompt),
+        ("placeholder", "{messages}")   # 🔥 CRITICAL
+    ])
+
+
+    chain = prompt | llm.with_structured_output(IntentOutput)
+
+    response = chain.invoke({"messages": state["messages"]})
+
+    return {
+        "intent": response.intent
+    }
+
+def route_selector(state: AgentState):
+    return state["intent"]
+
+def extract_entities_node(state: AgentState):
+    llm = ChatOpenAI(
+        model=settings.openai_llm_model,
+        api_key=settings.OPENAI_API_KEY.get_secret_value()
+    )
+
+    intent = state.get("intent")
+    meta_action = state.get("meta_action")
+
+    prompt = ChatPromptTemplate.from_messages([("system", f"""
+                You are an expert information extraction system for Power BI operations.
+                Your task is to extract structured fields from the conversation.
+
+                Intent: {intent}
+
+                EXTRACTION RULES
+         
+                If intent = migrate_dashboard:
+                - Extract:
+                - dashboard_name
+                - source_workspace (Dev or Prod)
+                - target_workspace (Dev or Prod)
+
+                If intent = delete_dashboard:
+                - Extract:
+                - dashboard_name
+                - target_workspace (Dev or Prod)
+                - DO NOT extract source_workspace
+
+                GENERAL RULES
+              
+                1. Use FULL conversation to understand the context (not just last message)
+                2. If user corrects something:
+                - Update ONLY that field
+                - Keep previously correct values
+                3. Normalize workspace names:
+                - dev, DEV → Dev
+                - prod, PROD → Prod
+                4. DO NOT guess values:
+                - If not clear, return null
+                5. Dashboard name:
+                - Extract exact phrase if possible
+                - Do not rephrase unnecessarily
+                6. If user gives partial info:
+                - Extract what is available
+                - Leave others as null
+                7. NEVER hallucinate missing fields
+
+                OUTPUT
+
+                Return structured output only.
+                """),
+        ("placeholder", "{messages}")
+    ])
+
+    chain = prompt | llm.with_structured_output(ExtractionOutput)
+    result = chain.invoke({"messages": state["messages"]})
+
+    if meta_action == "continue":
+        dashboard = result.dashboard_name or state.get("dashboard_name")
+        source = result.source_workspace or state.get("source_workspace")
+        target = result.target_workspace or state.get("target_workspace")
+
+    else:
+        dashboard = result.dashboard_name
+        source = result.source_workspace
+        target = result.target_workspace
+
+    return {
+        "dashboard_name": dashboard,
+
+        # 🔥 IMPORTANT LOGIC
+        "source_workspace": (
+            source if intent == "migrate_dashboard"
+            else None
+        ),
+
+        "target_workspace": target,
+
+        "extracted": True
+    }
+
+def meta_intent_node(state: AgentState):
+    llm = ChatOpenAI(model=settings.openai_llm_model,
+                     api_key=settings.OPENAI_API_KEY.get_secret_value())
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """
+            You analyze conversation flow between a user and an assistant.
+
+            Your task is to decide whether the user's latest message:
+
+            1. continue → continues the SAME task with more details or corrections
+            2. cancel → rejects or stops the current task
+            3. new_intent → starts a DIFFERENT task than before
+
+            Guidelines:
+
+            - Compare the user's latest request with the previous task.
+            - If the TYPE OF ACTION changes (e.g., from deleting to migrating), it is a new_intent.
+            - If the user is only refining details (like changing dashboard name or workspace), it is continue.
+            - If the user rejects the operation entirely, it is cancel.
+            - Focus on the meaning of the request, not specific words.
+            - Use the full conversation context.
+
+            Return ONLY one word:
+            continue OR cancel OR new_intent
+            """),
+                    ("placeholder", "{messages}")
+                ])
+    chain = prompt | llm.with_structured_output(MetaIntent)
+    result = chain.invoke({"messages": state["messages"]})
+    return {"meta_action": result.action}
+
+def meta_router(state: AgentState):
+    return state.get("meta_action", "continue")
 
 def clarification_node(state: AgentState):
     count = state.get("clarification_count", 0)
@@ -297,14 +500,17 @@ def confirmation_handler(state: AgentState):
 
     if last_msg in ["yes", "y"]:
         return {
-            "is_confirmed": True
+            "is_confirmed": True,
+             "messages": state["messages"] + [
+                AIMessage(content="✅received. Executing request...")]
         }
     elif last_msg in ["no", "n"]:
         return {
+            "intent": None,
+            "extracted": False,
             "messages": state["messages"] + [
                 AIMessage(content="❌ Operation cancelled.")
-            ],
-            "is_confirmed": False
+            ]
         }
     else:
         return {
@@ -313,192 +519,93 @@ def confirmation_handler(state: AgentState):
             ]
         }
     
-router_prompt = """
-You are an expert AI agent that classifies user intent for Power BI operations.
-
-Your task is to understand the user's goal and classify it into ONE of the following intents:
-
-1. recommend_dashboards  
-   → User is looking for suggestions, insights, or relevant dashboards based on a topic
-
-2. compare_workspaces  
-   → User wants to understand differences, gaps, discrepancies, or missing dashboards 
-     between Dev and Prod workspaces
-
-3. migrate_dashboard  
-   → User wants to move, promote, or deploy a dashboard from one workspace (Dev) to another (Prod)
-
-4. delete_dashboard  
-   → User wants to remove or delete a dashboard from a workspace
-
-5. ambiguous  
-   → The user intent is unclear, incomplete, or cannot be confidently mapped
-
----
-
-Guidelines:
-- Focus on the USER'S GOAL, not keywords
-- Use the full conversation context
-- If the user replies with short answers like "yes", "ok", infer intent from previous messages
-- Prefer compare_workspaces when the user is asking about differences, gaps, or missing items
-- Only select migrate_dashboard or delete_dashboard if the user clearly intends an ACTION
-- If unsure → return "ambiguous"
-- Do NOT ask questions
-- Do NOT explain
-
-Return only the intent.
-"""
-
-def router_decision(state: AgentState):
-    llm = ChatOpenAI(model=settings.openai_llm_model,api_key=settings.OPENAI_API_KEY.get_secret_value())
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt + "\n\n" + router_prompt),
-        ("placeholder", "{messages}")   # 🔥 CRITICAL
-    ])
-
-
-    chain = prompt | llm.with_structured_output(IntentOutput)
-
-    response = chain.invoke({"messages": state["messages"]})
-
-    return {
-        "intent": response.intent
-    }
-
-def route_selector(state: AgentState):
-    return state["intent"]
-
 def confirmation_node(state: AgentState):
+
+    if state.get("is_confirmed"):
+        return state
+
+    intent = state.get("intent")
+
+    if intent not in ["migrate_dashboard", "delete_dashboard"]:
+        return state
+
     dashboard = state.get("dashboard_name")
     source = state.get("source_workspace")
     target = state.get("target_workspace")
-    intent = state.get("intent")
 
-
-    if intent=="migrate_dashboard":
-
-        # If still missing → ask again
+    # ✅ VALIDATION FIRST
+    if intent == "migrate_dashboard":
         if not all([dashboard, source, target]):
             return {
                 "messages": state["messages"] + [
                     AIMessage(content="""
-                ⚠️ Missing required details for migration.
+                    ⚠️ Missing required details for migration.
 
-                Please provide:
-                dashboard_name, source_workspace, target_workspace
+                    Please provide:
+                    dashboard_name, source_workspace, target_workspace
 
-                Example:
-                invoice-dashboard, dev, prod
-                """)
-                            ]
-                        }
+                    Example:
+                    Sales-Dashboard, Dev, Prod
+                    """)
+                ]
+            }
 
         return {
             "messages": state["messages"] + [
                 AIMessage(content=f"""
-            ⚠️ You are about to MIGRATE a dashboard.
+                I understood your request as Migration:
 
-            Details:
-            - Dashboard: {dashboard}
-            - From: {source}
-            - To: {target}
+                - Dashboard: {dashboard}
+                - From: {source}
+                - To: {target}
 
-            👉 Please confirm to proceed (yes/no)
-            """.strip())
-                    ]
-                }
-    else:
+                👉 Reply **yes** to proceed or correct me.
+                """)
+                            ]
+                        }
+
+    elif intent == "delete_dashboard":
         if not all([dashboard, target]):
             return {
                 "messages": state["messages"] + [
                     AIMessage(content="""
-                ⚠️ Missing required details for deletion.
+                    ⚠️ Missing required details for deletion.
 
-                Please provide:
-                dashboard_name, target_workspace
+                    Please provide:
+                    dashboard_name, workspace
 
-                Example:
-                invoice-dashboard, Prod
-                """)
-                            ]
-                        }
+                    Example:
+                    Sales-Dashboard, Prod
+                    """)
+                                    ]
+                                }
+
         return {
             "messages": state["messages"] + [
                 AIMessage(content=f"""
-            ⚠️ You are about to Delete a dashboard.
+                I understood your request as Deletion:
 
-            Details:
-            - Dashboard: {dashboard}
-            - From: {target}
+                - Dashboard: {dashboard}
+                - Workspace: {target}
 
-            👉 Please confirm to proceed (yes/no)
-            """.strip())
-                    ]
-                }
-    
-def parse_migration_input(state: AgentState):
-    last_msg = state["messages"][-1].content.strip()
-
-    intent = state["intent"]
-
-    # Try parsing input
-    parts = [p.strip() for p in last_msg.split(",")]
-
-    if intent=="migrate_dashboard":
-
-
-        if len(parts) == 3:
-            return {
-                "dashboard_name": parts[0],
-                "source_workspace": parts[1],
-                "target_workspace": parts[2]
-            }
-
-        # ❌ If not proper input → ASK USER
-        return {
-            "messages": state["messages"] + [
-                AIMessage(content="""
-                    Please provide the required details in this format:
-
-                    dashboard_name, source_workspace, target_workspace
-
-                    Example:
-                    invoice-dashboard, dev, prod
-                    """)
-                            ]
-                        }
-    else:
-        if len(parts)==2:
-            return {
-                "dashboard_name": parts[0],
-                "target_workspace": parts[1]
-            }
-        return {"messages": state["messages"] + [
-                AIMessage(content="""
-                    Please provide the required details in this format:
-
-                    dashboard_name, target_workspace
-
-                    Example:
-                    invoice-dashboard,prod
-                    """)
+                👉 Reply **yes** to proceed or correct me.
+                """)
                             ]
                         }
 
-def entry_router(state: AgentState):
-    last_msg = state["messages"][-1].content.lower().strip()
 
-    # ✅ confirmation response
-    if last_msg in ["yes", "no", "y", "n"]:
-        return "confirmation"
-
-    # ✅ input details (simple heuristic)
-    if state.get("intent") in ["migrate_dashboard", "delete_dashboard"] and "," in last_msg:
-        return "input"
-        
-
-    return "router"
+def cancel_node(state: AgentState):
+    return {
+        "intent": None,
+        "dashboard_name": None,
+        "source_workspace": None,
+        "target_workspace": None,
+        "extracted": False,
+        "is_confirmed": False,
+        "messages": state["messages"] + [
+            AIMessage(content="👍 Operation cancelled. What would you like to do next?")
+        ]
+    }
 
 def health_check_node(state: AgentState):
     result = check_health.invoke({}) 
@@ -573,19 +680,35 @@ def tool_executor(state: AgentState):
         ]
     }
 
+def reset_for_new_intent(state: AgentState):
+    return {
+        "intent": None,
+        "dashboard_name": None,
+        "source_workspace": None,
+        "target_workspace": None,
+        "extracted": False,
+        "is_confirmed": False,
+        "clarification_count": 0,
+        "meta_action": None
+    }
 
 memory = MemorySaver()
 
 graph = StateGraph(AgentState)
 
 graph.add_node("Question_Receiver", agent_state_node)
+graph.add_node("MetaIntent", meta_intent_node)
+graph.add_node("Cancel", cancel_node)
 graph.add_node("Router", router_decision)
-graph.add_node("Clarification", clarification_node)
-graph.add_node("InputParser", parse_migration_input)
+graph.add_node("Extractor", extract_entities_node)
 graph.add_node("Confirmation", confirmation_node)
 graph.add_node("ConfirmationHandler", confirmation_handler)
 graph.add_node("HealthCheck", health_check_node)
 graph.add_node("ToolExecutor", tool_executor)
+
+graph.add_edge("Cancel", END)
+
+graph.add_node("Reset", reset_for_new_intent)
 
 # ENTRY
 graph.add_edge(START, "Question_Receiver")
@@ -594,48 +717,43 @@ graph.add_conditional_edges(
     "Question_Receiver",
     entry_router,
     {
-        "router": "Router",
         "confirmation": "ConfirmationHandler",
-        "input": "InputParser"
+        "router": "MetaIntent"   # 🔥 FIXED
     }
 )
 
+graph.add_conditional_edges(
+    "MetaIntent",
+    meta_router,
+    {
+        "continue": "Router",
+        "cancel": "Cancel",
+        "new_intent": "Reset"   # 🔥 IMPROVED
+    }
+)
 
-# ROUTER
+graph.add_edge("Reset", "Router")
+
 graph.add_conditional_edges(
     "Router",
     route_selector,
     {
         "recommend_dashboards": "HealthCheck",
         "compare_workspaces": "HealthCheck",
-        "migrate_dashboard": "InputParser",  
-        "delete_dashboard": "InputParser",
-        "ambiguous": "Clarification"
+        "migrate_dashboard": "Extractor",
+        "delete_dashboard": "Extractor",
+        "ambiguous": "Question_Receiver"   # 🔥 FIXED
     }
 )
 
-# CLARIFICATION
-graph.add_conditional_edges(
-    "Clarification",
-    lambda state: "end" if state.get("clarification_count", 0) >= 3 else "continue",
-    {
-        "continue": "Router",
-        "end": END
-    }
-)
-
-# INPUT → CONFIRM
-graph.add_edge("InputParser", "Confirmation")
-
-# CONFIRM → HANDLE
-graph.add_edge("Confirmation", "ConfirmationHandler")
+graph.add_edge("Extractor", "Confirmation")
 
 graph.add_conditional_edges(
     "ConfirmationHandler",
-    lambda state: "proceed" if state.get("is_confirmed") else "end",
+    lambda s: "proceed" if s.get("is_confirmed") else "retry",
     {
         "proceed": "HealthCheck",
-        "end": END
+        "retry": "Question_Receiver"
     }
 )
 
@@ -646,8 +764,9 @@ graph.add_edge("ToolExecutor", END)
 # COMPILE
 agent = graph.compile(
     checkpointer=memory,
-    interrupt_after=["Confirmation"]  # ✅ now valid
+    interrupt_after=["Confirmation"]
 )
+
 
 if __name__ == "__main__":
     
@@ -713,9 +832,9 @@ if __name__ == "__main__":
     response = agent.invoke(
     {
         "messages": [
-            SystemMessage(content=system_prompt),
+            
             HumanMessage(
-                content="Sales-Dashboard, Prod")
+                content="Sorry, i want to migrate Sales-Dashboard from dev to prod")
         ]
     },
     config=thread
@@ -723,18 +842,18 @@ if __name__ == "__main__":
 
     print(response["messages"][-1].content)
 
-    thread = {"configurable": {"thread_id": "3"}}
-    response = agent.invoke(
-    {
-        "messages": [
-            SystemMessage(content=system_prompt),
-            HumanMessage(
-                content="yes")
-        ]
-    },
-    config=thread
-    )
+    # thread = {"configurable": {"thread_id": "3"}}
+    # response = agent.invoke(
+    # {
+    #     "messages": [
+    #         SystemMessage(content=system_prompt),
+    #         HumanMessage(
+    #             content="yes")
+    #     ]
+    # },
+    # config=thread
+    # )
 
-    print(response["messages"][-1].content)
+    # print(response["messages"][-1].content)
 
 

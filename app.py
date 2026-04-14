@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import ast
 from src.config import Settings
 
 # ---------------- CONFIG ----------------
@@ -81,8 +82,25 @@ if prompt:
 
                 if response.status_code == 200:
                     data = response.json()
-                    payload = data.get("data", {})
+                    
+                    if "response" in data:
+                        raw_response = data["response"]
 
+                        try:
+                            if isinstance(raw_response, str):
+                                parsed = ast.literal_eval(raw_response)
+                            else:
+                                parsed = raw_response
+                            data = parsed
+                        except Exception as e:
+                            st.chat_message("assistant").write(raw_response)
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": raw_response
+                            })
+                            st.stop()
+
+                    payload = data.get("data", {})            
                     # ---------------- DASHBOARD RECOMMENDATION ----------------
                     if "dashboards" in payload:
                         dashboards = payload["dashboards"]
@@ -177,8 +195,18 @@ if prompt:
 
                     # ---------------- FALLBACK ----------------
                     else:
-                        st.error("Unknown response format")
-                        st.write(data)
+                        # Try conversational fallback
+                        if "response" in data:
+                            reply = data["response"]
+                            st.chat_message("assistant").write(reply)
+
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": reply
+                            })
+                        else:
+                            
+                            st.write(data)
 
             except requests.exceptions.Timeout:
                 st.error("⏰ The request timed out. Please try again.")

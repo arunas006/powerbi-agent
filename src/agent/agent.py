@@ -692,6 +692,62 @@ def reset_for_new_intent(state: AgentState):
         "meta_action": None
     }
 
+def llm_response_node(state: AgentState):
+    llm = ChatOpenAI(
+        model=settings.openai_llm_model,
+        api_key=settings.OPENAI_API_KEY.get_secret_value()
+    )
+
+    intent = state.get("intent")
+    user_query = state.get("user_query")
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", f"""
+        You are a helpful AI assistant specialized in Power BI.
+
+        CONTEXT:
+        - Detected intent: {intent}
+        - User query: {user_query}
+
+        BEHAVIOR RULES:
+
+        1. If the query is general conversation (hi, hello, casual talk):
+        → Respond naturally like a human assistant
+
+        2. If the query is unclear but related to Power BI:
+        → Ask ONE smart clarification question
+
+        3. If the user seems to want an action (delete/migrate/etc.) but it's incomplete:
+        → Guide them with what info is missing (DO NOT execute anything)
+
+        4. If the user is totally unrelated to Power BI:
+        → Politely steer them back to supported capabilities
+
+        5. Keep responses:
+        - Short
+        - Friendly
+        - Action-oriented
+
+        DO NOT:
+        - Hallucinate dashboards
+        - Trigger tools
+        - Be overly verbose
+                """),
+                ("placeholder", "{messages}")
+            ])
+
+    chain = prompt | llm | StrOutputParser()
+
+    response = chain.invoke({
+        "messages": state["messages"]
+    })
+
+    return {
+        "messages": state["messages"] + [
+            AIMessage(content=response)
+        ]
+    }
+
 memory = MemorySaver()
 
 graph = StateGraph(AgentState)
@@ -705,6 +761,7 @@ graph.add_node("Confirmation", confirmation_node)
 graph.add_node("ConfirmationHandler", confirmation_handler)
 graph.add_node("HealthCheck", health_check_node)
 graph.add_node("ToolExecutor", tool_executor)
+graph.add_node("LLM_Response", llm_response_node)
 
 graph.add_edge("Cancel", END)
 
@@ -742,7 +799,7 @@ graph.add_conditional_edges(
         "compare_workspaces": "HealthCheck",
         "migrate_dashboard": "Extractor",
         "delete_dashboard": "Extractor",
-        "ambiguous": "Question_Receiver"   # 🔥 FIXED
+        "ambiguous": "LLM_Response"   # 🔥 FIXED
     }
 )
 
@@ -820,7 +877,7 @@ if __name__ == "__main__":
         "messages": [
             SystemMessage(content=system_prompt),
             HumanMessage(
-                content="I need to delete Sales-Dashboard from prod")
+                content="Hi how can you assist me today?")
         ]
     },
     config=thread
@@ -828,19 +885,19 @@ if __name__ == "__main__":
 
     print(response["messages"][-1].content)
 
-    thread = {"configurable": {"thread_id": "3"}}
-    response = agent.invoke(
-    {
-        "messages": [
+    # thread = {"configurable": {"thread_id": "3"}}
+    # response = agent.invoke(
+    # {
+    #     "messages": [
             
-            HumanMessage(
-                content="Sorry, i want to migrate Sales-Dashboard from dev to prod")
-        ]
-    },
-    config=thread
-    )
+    #         HumanMessage(
+    #             content="Sorry, i want to migrate Sales-Dashboard from dev to prod")
+    #     ]
+    # },
+    # config=thread
+    # )
 
-    print(response["messages"][-1].content)
+    # print(response["messages"][-1].content)
 
     # thread = {"configurable": {"thread_id": "3"}}
     # response = agent.invoke(

@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     api_workers: int = 1
     BASE_URL: str = "https://powerbi-n7h5.onrender.com" #"http://localhost:8000"
     AGENT_URL: str = "https://powerbi-agent.onrender.com"
+    
 
 _settings : Settings | None = None
 
